@@ -17,7 +17,7 @@ export function collapseRepeatedLabel(text: string): string {
 
 export function isSectionHeading(text: string): boolean {
   const n = normalizeText(text)
-  return /^(situation professionnelle|situation personnelle|ressources actuelles|votre agence|pieces complementaires|fiche de renseignements|candidat locataire|pour toutes les situations|page \d+|locataire 1 locataire 2|cautionnaire 1 cautionnaire 2)$/.test(
+  return /^(situation professionnelle|situation personnelle|situation de famille|ressources actuelles|votre agence|pieces complementaires|fiche de renseignements|candidat locataire|pour toutes les situations|page \d+|locataire 1 locataire 2|cautionnaire 1 cautionnaire 2|identite|etat civil|domicile actuel|coordonnees|cadre reserve.*)$/.test(
     n,
   )
 }

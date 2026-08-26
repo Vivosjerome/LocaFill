@@ -7,18 +7,28 @@ import { confidenceFromScore, scoreField } from './score'
 import { formatForField, readProfileValue, tenantLabel } from './values'
 import { mapChoiceField } from './choices'
 import { normalizeText } from './normalize'
+import { roleHintFromText } from '@/lib/forms/parseHtml'
 
 export function resolveTenantIndex(field: DetectedField, profile: AppProfile): number | null {
-  if (field.roleHint === 'guarantor') {
+  const roleHint = effectiveRole(field)
+  if (roleHint === 'guarantor') {
     const idxs = roleIndices(profile, 'guarantor')
     const slot = Math.max(0, field.tenantHint)
     return idxs[slot] ?? null
   }
   const occupants = profile.tenants.flatMap((t, i) => (t.role === 'guarantor' ? [] : [i]))
-  if (field.roleHint === 'cotenant' || field.tenantHint >= 1) {
-    return occupants[1] ?? null
+  if (roleHint === 'cotenant' || field.tenantHint >= 1) {
+    const slot = Math.max(field.tenantHint, 1)
+    return occupants[slot] ?? null
   }
   return occupants[0] ?? (profile.tenants[0] ? 0 : null)
+}
+
+function effectiveRole(field: DetectedField): DetectedField['roleHint'] {
+  const fromLabel = roleHintFromText(field.label)
+  if (field.roleHint === 'guarantor' || fromLabel === 'guarantor') return 'guarantor'
+  if (field.roleHint === 'cotenant' || fromLabel === 'cotenant') return 'cotenant'
+  return field.roleHint
 }
 
 function roleIndices(profile: AppProfile, role: TenantRole): number[] {

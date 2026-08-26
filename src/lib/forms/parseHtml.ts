@@ -90,7 +90,11 @@ export function parseHtmlRegex(html: string): DetectedField[] {
     const name = attr(attrs, 'name') || attr(attrs, 'formcontrolname') || ''
     const htmlId = attr(attrs, 'id')
     const placeholder = attr(attrs, 'placeholder')
-    const label = attr(attrs, 'aria-label') || placeholder || name || htmlId
+    const aria = attr(attrs, 'aria-label')
+    const before = html.slice(Math.max(0, match.index - 180), match.index)
+    const wrapped = before.match(/<label\b[^>]*>([^<]*)$/i)
+    const wrapLabel = wrapped?.[1]?.replace(/\s+/g, ' ').trim() ?? ''
+    const label = aria || wrapLabel || placeholder || name || htmlId
     const key = `${name}|${htmlId}|${label}`
     if (seen.has(key)) continue
     seen.add(key)
@@ -109,7 +113,7 @@ export function parseHtmlRegex(html: string): DetectedField[] {
       options: [],
       required: /\srequired\b/i.test(attrs),
       tenantHint: tenantHintFromText(`${label} ${name}`),
-      roleHint: roleHintFromText(label),
+      roleHint: roleHintFromText(`${label} ${name}`),
       raw: { name, id: htmlId, type, label },
     })
     index += 1
@@ -318,7 +322,8 @@ function attr(source: string, name: string): string {
 export function tenantHintFromText(text: string): number {
   const n = text.toLowerCase()
   if (/locataire\s*2|tenant\s*2|applicant\s*2|co[- ]?locataire|conjoint|co[- ]?titulaire/.test(n)) return 1
-  if (/garant|guarantor|caution/.test(n)) return 2
+  if (/(?:garant|guarantor|cautionnaire|caution)\s*2/.test(n)) return 1
+  if (/garant|guarantor|caution/.test(n)) return 0
   const num = n.match(/(?:locataire|tenant|applicant)\s*(\d)/)
   if (num) return Math.max(0, Number(num[1]) - 1)
   return 0

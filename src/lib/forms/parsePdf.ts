@@ -116,8 +116,8 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
     if (pageKind === 'skip') continue
 
     const pageW = page.view[2] - page.view[0]
-    const colSplit = findColumnSplit(lines, pageW, pageText)
-    const twoCols = colSplit != null
+    const layout = findColumnLayout(lines, pageW, pageText)
+    const splits = layout.splits
     const docPage = pageKind === 'tenant-docs' || pageKind === 'guarantor-docs'
 
     const annotations = await page.getAnnotations()
@@ -142,7 +142,7 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
       if (item.kind === 'text' && isMaritalDetailLabel(label)) continue
       if (pageKind === 'employer-letter' && isEmployerSignatoryLabel(label)) continue
 
-      const slot = twoCols && item.widget.rect.x1 >= (colSplit ?? pageW * 0.5) ? 1 : 0
+      const slot = columnSlot(item.widget.rect.x1, splits)
       const tenant = hintsForPage(pageKind, slot)
 
       fields.push({
@@ -171,18 +171,17 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
         if (ocrLines.length) layoutLines = ocrLines
       }
       const guides = await extractFillGuides(page)
-      fields.push(
-        ...extractLayoutFields({
-          lines: layoutLines,
-          pageIndex: i,
-          pageW,
-          pageKind,
-          twoCols,
-          occupied: pending.map((p) => p.widget.rect),
-          guides,
-          colSplit,
-        }),
-      )
+      const layoutFields = extractLayoutFields({
+        lines: layoutLines,
+        pageIndex: i,
+        pageW,
+        pageKind,
+        occupied: pending.map((p) => p.widget.rect),
+        guides,
+        splits: layout.splits,
+        headers: layout.headers,
+      })
+      fields.push(...applySectionRoles(layoutFields, layoutLines, i, pageKind, layout.splits))
     }
   }
 
@@ -367,16 +366,18 @@ function overlayRaw(
   w: number,
   h: number,
   fieldName = '',
+  kind = '',
 ): Record<string, string> {
   return {
     fieldName,
     page: String(page),
     acrobat: fieldName,
-    x: String(Math.round(x)),
-    y: String(Math.round(y)),
+    x: String(Math.round(x * 10) / 10),
+    y: String(Math.round(y * 10) / 10),
     w: String(Math.round(Math.max(24, w))),
     h: String(Math.round(Math.max(8, h))),
     overlay: '1',
+    kind,
   }
 }
 
@@ -385,6 +386,7 @@ interface FillZone {
   x2: number
   y: number
   h: number
+  kind: 'leader' | 'line' | 'box'
 }
 
 async function extractFillGuides(page: PdfJs.PDFPageProxy): Promise<{ lines: FillZone[]; boxes: FillZone[] }> {
@@ -450,9 +452,10 @@ async function extractFillGuides(page: PdfJs.PDFPageProxy): Promise<{ lines: Fil
       const h = box.y2 - box.y1
       if (w < 18) continue
       if (h <= 3.8) {
-        raw.push({ x1: box.x1, x2: box.x2, y: (box.y1 + box.y2) / 2, h: Math.max(h, 1) })
+        if (w > pageW * 0.78) continue
+        raw.push({ x1: box.x1, x2: box.x2, y: (box.y1 + box.y2) / 2, h: Math.max(h, 1), kind: 'line' })
       } else if (h >= 7 && h <= 42 && w >= 28) {
-        boxes.push({ x1: box.x1, x2: box.x2, y: box.y1, h })
+        boxes.push({ x1: box.x1, x2: box.x2, y: box.y1, h, kind: 'box' })
       }
     }
   }
@@ -462,27 +465,28 @@ async function extractFillGuides(page: PdfJs.PDFPageProxy): Promise<{ lines: Fil
 
 function readMinMax(args: unknown): number[] | null {
   const list = Array.isArray(args) ? args : args != null ? [args] : []
-  for (const item of list) {
-    if (!item) continue
-    if (Array.isArray(item) && item.length >= 4 && item.slice(0, 4).every((v) => typeof v === 'number')) {
-      const [a, b, c, d] = item as number[]
-      return [Math.min(a, c), Math.min(b, d), Math.max(a, c), Math.max(b, d)]
-    }
-    if (typeof item === 'object' && item !== null && 'length' in item) {
-      const arr = Array.from(item as ArrayLike<number>)
-      if (arr.length >= 4 && arr.slice(0, 4).every((v) => typeof v === 'number' && Number.isFinite(v))) {
-        return [Math.min(arr[0], arr[2]), Math.min(arr[1], arr[3]), Math.max(arr[0], arr[2]), Math.max(arr[1], arr[3])]
-      }
-    }
+  const candidates = list.length ? [list[list.length - 1], ...list] : []
+  for (const item of candidates) {
+    if (!item || typeof item !== 'object' || !('length' in item)) continue
+    const arr = Array.from(item as ArrayLike<unknown>)
+    if (arr.length < 4 || arr.length > 8) continue
+    const nums = arr.slice(0, 4)
+    if (!nums.every((v) => typeof v === 'number' && Number.isFinite(v))) continue
+    const [a, b, c, d] = nums as number[]
+    return [Math.min(a, c), Math.min(b, d), Math.max(a, c), Math.max(b, d)]
   }
   return null
 }
 
-function mergeZones(zones: FillZone[], gap: number): FillZone[] {
+function mergeZones(zones: FillZone[], gap: number, splits: number[] = []): FillZone[] {
   const sorted = [...zones].sort((a, b) => a.y - b.y || a.x1 - b.x1)
   const out: FillZone[] = []
+  const sameCol = (a: FillZone, b: FillZone) =>
+    columnSlot((a.x1 + a.x2) / 2, splits) === columnSlot((b.x1 + b.x2) / 2, splits)
   for (const z of sorted) {
-    const hit = out.find((o) => Math.abs(o.y - z.y) < 2.2 && z.x1 <= o.x2 + gap && z.x2 >= o.x1 - gap)
+    const hit = out.find(
+      (o) => sameCol(o, z) && o.kind === z.kind && Math.abs(o.y - z.y) < 2.2 && z.x1 <= o.x2 + gap && z.x2 >= o.x1 - gap,
+    )
     if (hit) {
       hit.x1 = Math.min(hit.x1, z.x1)
       hit.x2 = Math.max(hit.x2, z.x2)
@@ -495,8 +499,8 @@ function mergeZones(zones: FillZone[], gap: number): FillZone[] {
 function isLeaderText(text: string): boolean {
   const t = text.replace(/\s/g, '')
   if (!t) return false
-  if (/^[.\-_·•…=\u2013\u2014]{1,}$/.test(t)) return true
-  const rest = t.replace(/[.\-_·•…=\u2013\u2014]/g, '')
+  if (/^[.\-_·•…⋯‥=\u2013\u2014\u2025\u2026\u22ef\u2219]{1,}$/u.test(t)) return true
+  const rest = t.replace(/[.\-_·•…⋯‥=\u2013\u2014\u2025\u2026\u22ef\u2219]/gu, '')
   return t.length >= 3 && rest.length / t.length <= 0.2
 }
 
@@ -508,7 +512,7 @@ function leaderZonesFromLine(line: PdfLine): FillZone[] {
     const x1 = run[0].x
     const last = run[run.length - 1]
     const x2 = last.x + last.w
-    if (x2 - x1 >= 16) zones.push({ x1, x2, y: line.y, h: Math.max(line.h, 8) })
+    if (x2 - x1 >= 16) zones.push({ x1, x2, y: line.y, h: Math.max(line.h, 8), kind: 'leader' })
     run = []
   }
   for (const bit of line.bits) {
@@ -519,14 +523,39 @@ function leaderZonesFromLine(line: PdfLine): FillZone[] {
       const leaderLen = mixed[2].length / Math.max(1, bit.str.length)
       const x1 = bit.x + bit.w * startRatio
       const x2 = x1 + bit.w * leaderLen
-      if (x2 - x1 >= 16) zones.push({ x1, x2, y: line.y, h: Math.max(line.h, 8) })
+      if (x2 - x1 >= 16) zones.push({ x1, x2, y: line.y, h: Math.max(line.h, 8), kind: 'leader' })
       continue
     }
-    if (isLeaderText(bit.str)) run.push(bit)
-    else flush()
+    if (isLeaderText(bit.str)) {
+      if (run.length) {
+        const prev = run[run.length - 1]
+        if (bit.x - (prev.x + prev.w) > 8) flush()
+      }
+      run.push(bit)
+    } else flush()
   }
   flush()
   return zones
+}
+
+function clipZone(z: FillZone, x1: number, x2: number): FillZone | null {
+  const left = Math.max(z.x1, x1)
+  const right = Math.min(z.x2, x2)
+  if (right - left < 20) return null
+  return { ...z, x1: left, x2: right }
+}
+
+function expandEmailZone(zone: FillZone | null, label: string, colRight: number): FillZone | null {
+  if (!zone) return null
+  if (!/(e-?mail|mail|courriel)/i.test(normalizeText(label))) return zone
+  const need = zone.x1 + 190
+  return { ...zone, x2: Math.max(zone.x2, Math.min(colRight, need)) }
+}
+
+function fillY(zone: FillZone): number {
+  if (zone.kind === 'line') return zone.y + 2.2
+  if (zone.kind === 'box') return zone.y + Math.min(4, zone.h * 0.28)
+  return zone.y
 }
 
 function extractLayoutFields(input: {
@@ -534,36 +563,40 @@ function extractLayoutFields(input: {
   pageIndex: number
   pageW: number
   pageKind: PdfPageKind
-  twoCols: boolean
   occupied: PdfWidget['rect'][]
   guides: { lines: FillZone[]; boxes: FillZone[] }
-  colSplit: number | null
+  splits: number[]
+  headers: number[]
 }): DetectedField[] {
-  const { lines, pageIndex, pageW, pageKind, occupied, guides, colSplit } = input
+  const { lines, pageIndex, pageW, pageKind, occupied, guides, splits, headers } = input
   const fields: DetectedField[] = []
   const textLeaders = lines.flatMap(leaderZonesFromLine)
-  const allLines = splitAcrossColumn(mergeZones([...guides.lines, ...textLeaders], 6), colSplit)
-  const boxes = splitAcrossColumn(guides.boxes, colSplit)
+  const allLines = mergeZones(splitAcrossColumn([...guides.lines, ...textLeaders], splits), 6, splits)
+  const boxes = mergeZones(splitAcrossColumn(guides.boxes, splits), 4, splits)
 
   const taken = (x: number, y: number) =>
     occupied.some((r) => x >= r.x1 - 8 && x <= r.x2 + 8 && y >= r.y1 - 8 && y <= r.y2 + 8)
 
-  const colEnd = (x: number) => (colSplit != null && x < colSplit ? colSplit - 10 : pageW - 16)
+  const colEnd = (x: number) => {
+    const next = splits.find((s) => x < s)
+    return next != null ? next - 8 : pageW - 16
+  }
+
+  const sameCol = (z: FillZone, left: number) => columnSlot((z.x1 + z.x2) / 2, splits) === columnSlot(left, splits)
 
   const labelBits = (line: PdfLine) =>
     line.bits.filter((b) => !isLeaderText(b.str) && b.str.replace(/[.\-_·•…]/g, '').trim().length > 0)
 
-  const push = (label: string, zone: FillZone, nearby: string, labelX: number) => {
+  const push = (label: string, zone: FillZone, nearby: string, atX: number) => {
     const cleaned = cleanLabel(label.replace(/[.\-_·•…]{2,}/g, ' '))
     if (!cleaned || isNoisePdfLabel(cleaned) || isSectionHeading(cleaned) || isDocumentChecklist(cleaned)) return
     if (!looksLikeFieldLabel(cleaned)) return
     if (isMaritalDetailLabel(cleaned) || isEmployerSignatoryLabel(cleaned)) return
-    const x = zone.x1 + 2
-    const w = zone.x2 - zone.x1 - 4
-    const y = zone.y + Math.min(3, zone.h * 0.25)
-    if (taken(x, y) || w < 28) return
-    const slot = colSplit != null && labelX >= colSplit ? 1 : 0
-    const tenant = hintsForPage(pageKind, slot)
+    const x = zone.x1
+    const w = zone.x2 - zone.x1
+    const y = fillY(zone)
+    if (taken(x, y) || w < 18) return
+    const tenant = hintsForPage(pageKind, columnSlot(atX, splits))
     occupied.push({ x1: zone.x1, y1: zone.y - 4, x2: zone.x2, y2: zone.y + zone.h + 4 })
     fields.push({
       id: `pdf_overlay_${pageIndex}_${Math.round(x)}_${Math.round(y)}_${fields.length}`,
@@ -580,41 +613,36 @@ function extractLayoutFields(input: {
       required: false,
       tenantHint: tenant.tenantHint,
       roleHint: tenant.roleHint,
-      raw: overlayRaw(pageIndex, x, y, w, Math.max(9, zone.h)),
+      raw: overlayRaw(pageIndex, x, y, w, Math.max(9, zone.h), '', zone.kind),
     })
   }
 
   const zoneFor = (labelEnd: number, labelY: number, left: number): FillZone | null => {
     const right = colEnd(left)
-    const sameCol = (z: FillZone) =>
-      colSplit == null || (left < colSplit ? z.x2 <= colSplit + 8 : z.x1 >= colSplit - 8)
     const onRow = (z: FillZone) =>
-      sameCol(z) && Math.abs(z.y - labelY) <= 9 && z.x2 > labelEnd + 6 && z.x1 < right + 8
-    const rowLeaders = allLines.filter((z) => onRow(z) && z.x1 >= labelEnd - 12).sort((a, b) => a.x1 - b.x1)
-    if (rowLeaders[0]) {
-      const z = rowLeaders[0]
-      const x1 = Math.min(labelEnd + 4, right - 40)
-      if (right - x1 < 28) return null
-      return { x1, x2: right, y: z.y, h: Math.max(z.h, 9) }
-    }
+      sameCol(z, left) && Math.abs(z.y - labelY) <= 9 && z.x2 > labelEnd + 8 && z.x1 < right + 8
+    const rowLeaders = allLines
+      .filter(onRow)
+      .map((z) => clipZone(z, labelEnd + 3, right))
+      .filter((z): z is FillZone => z != null && z.x1 >= labelEnd - 8)
+      .sort((a, b) => a.x1 - b.x1 || b.x2 - b.x1 - (a.x2 - a.x1))
+    const headerX = headers[0]
+    const preferred =
+      headerX != null ? rowLeaders.filter((z) => z.x2 > headerX + 16) : rowLeaders
+    if (preferred[0]) return { ...preferred[0], h: Math.max(preferred[0].h, 9) }
+    if (rowLeaders[0]) return { ...rowLeaders[0], h: Math.max(rowLeaders[0].h, 9) }
+
     const rowBox = boxes
-      .filter((z) => sameCol(z) && Math.abs(z.y + z.h / 2 - labelY) <= 12 && z.x1 >= labelEnd - 8 && z.x1 < right)
+      .filter((z) => sameCol(z, left) && Math.abs(z.y + z.h / 2 - labelY) <= 12 && z.x1 >= labelEnd - 8 && z.x1 < right)
       .sort((a, b) => a.x1 - b.x1)[0]
     if (rowBox) {
-      const x1 = Math.min(Math.max(rowBox.x1 + 2, labelEnd + 4), right - 40)
-      return { x1, x2: right, y: rowBox.y + 2, h: rowBox.h }
+      return clipZone(rowBox, Math.max(rowBox.x1, labelEnd + 3), Math.min(rowBox.x2, right))
     }
     const below = [...allLines, ...boxes]
-      .filter((z) => sameCol(z) && z.y < labelY - 1 && labelY - z.y < 22 && z.x2 > labelEnd - 20 && z.x1 < right)
-      .sort((a, b) => labelY - (a.y + (a.h || 0)) - (labelY - (b.y + (b.h || 0))) || a.x1 - b.x1)
-    if (below[0]) {
-      const z = below[0]
-      return {
-        x1: Math.min(Math.max(z.x1, left), z.x2 - 24),
-        x2: right,
-        y: z.y + 2,
-        h: Math.max(z.h, 9),
-      }
+      .filter((z) => sameCol(z, left) && z.y < labelY - 1 && labelY - z.y < 26 && z.x2 > labelEnd - 20 && z.x1 < right)
+      .sort((a, b) => labelY - a.y - (labelY - b.y) || a.x1 - b.x1)[0]
+    if (below) {
+      return clipZone(below, Math.max(below.x1, Math.min(left, below.x2 - 40)), Math.min(below.x2, right))
     }
     return null
   }
@@ -637,31 +665,29 @@ function extractLayoutFields(input: {
         .replace(/\s+/g, ' ')
         .trim()
       const end = group[group.length - 1].x + group[group.length - 1].w
-      let zone = zoneFor(end, line.y, group[0].x)
-      if (!zone) {
-        const nextX = groups[gi + 1]?.[0]?.x ?? colEnd(group[0].x)
-        if (nextX - end >= 40) {
-          zone = { x1: end + 8, x2: colEnd(group[0].x), y: line.y, h: Math.max(line.h, 10) }
-        }
-      }
-      if (zone) {
-        push(label, zone, line.text, group[0].x)
-        const labelX = group[0].x
-        if (colSplit != null && labelX < colSplit) {
-          const hasRightLabel = groups.some((g) => g[0].x >= colSplit)
-          if (!hasRightLabel) {
-            const rightLead = allLines
-              .filter((z) => z.x1 >= colSplit - 8 && Math.abs(z.y - line.y) <= 9)
-              .sort((a, b) => a.x1 - b.x1)[0]
-            const rightZone: FillZone = {
-              x1: rightLead ? Math.max(colSplit + 6, rightLead.x1) : colSplit + 10,
-              x2: pageW - 16,
-              y: zone.y,
-              h: zone.h,
-            }
-            if (rightZone.x2 - rightZone.x1 >= 28) push(label, rightZone, line.text, colSplit + 8)
-          }
-        }
+      const zone = zoneFor(end, line.y, group[0].x)
+      if (!zone) continue
+      const usable = expandEmailZone(zone, label, colEnd(group[0].x))
+      if (!usable) continue
+      push(label, usable, line.text, group[0].x)
+      if (!splits.length || group[0].x >= splits[0]) continue
+      const hasOtherLabel = groups.some((g) => columnSlot(g[0].x, splits) > 0)
+      if (hasOtherLabel) continue
+      for (let s = 0; s < splits.length; s += 1) {
+        const leftBound = splits[s] + 8
+        const rightBound = splits[s + 1] ?? pageW - 16
+        const lead = [...allLines, ...boxes]
+          .filter(
+            (z) =>
+              z.x1 >= leftBound - 12 &&
+              z.x1 < rightBound &&
+              Math.abs(z.y - line.y) <= 12 &&
+              z.x2 - z.x1 >= 28,
+          )
+          .sort((a, b) => a.x1 - b.x1)[0]
+        if (!lead) continue
+        const rightZone = expandEmailZone(clipZone(lead, lead.x1, rightBound), label, rightBound)
+        if (rightZone) push(label, rightZone, line.text, leftBound + 24)
       }
     }
   }
@@ -753,36 +779,54 @@ function applyDuplicateIdentityPages(fields: DetectedField[], textParts: string[
   })
 }
 
-function splitAcrossColumn(zones: FillZone[], split: number | null): FillZone[] {
-  if (split == null) return zones
-  const out: FillZone[] = []
-  for (const z of zones) {
-    if (z.x1 < split - 6 && z.x2 > split + 6) {
-      out.push({ ...z, x2: split - 6 })
-      out.push({ ...z, x1: split + 6 })
-    } else {
-      out.push(z)
+function splitAcrossColumn(zones: FillZone[], splits: number[]): FillZone[] {
+  if (!splits.length) return zones
+  let out = zones
+  for (const split of splits) {
+    const next: FillZone[] = []
+    for (const z of out) {
+        if (z.x1 < split - 6 && z.x2 > split + 6) {
+        if (z.kind === 'line') continue
+        if (split - 6 - z.x1 >= 16) next.push({ ...z, x2: split - 6 })
+        if (z.x2 - (split + 6) >= 16) next.push({ ...z, x1: split + 6 })
+      } else {
+        next.push(z)
+      }
     }
+    out = next
   }
   return out.filter((z) => z.x2 - z.x1 >= 16)
 }
 
-function findColumnSplit(lines: PdfLine[], pageW: number, pageText: string): number | null {
+function columnSlot(x: number, splits: number[]): number {
+  let slot = 0
+  for (const split of splits) {
+    if (x >= split) slot += 1
+    else break
+  }
+  return slot
+}
+
+function findColumnLayout(lines: PdfLine[], pageW: number, pageText: string): { splits: number[]; headers: number[] } {
+  const role = '(?:locataire|cautionnaire|caution|garant|candidat)'
   for (const line of lines) {
-    const n = normalizeText(line.text)
-    const has1 = /(?:locataire|cautionnaire|caution|garant|candidat)\s*1/.test(n)
-    const has2 = /(?:locataire|cautionnaire|caution|garant|candidat)\s*2/.test(n)
-    if (!has1 || !has2) continue
-    let x1: number | undefined
-    let x2: number | undefined
+    const found: { n: number; x: number }[] = []
     const bits = line.bits
     for (let i = 0; i < bits.length; i += 1) {
+      if (!new RegExp(role).test(normalizeText(bits[i].str))) continue
       const local = normalizeText(bits.slice(i, i + 4).map((b) => b.str).join(' '))
-      if (x1 == null && /(?:locataire|cautionnaire|caution|garant|candidat)\s*1/.test(local)) x1 = bits[i].x
-      if (/(?:locataire|cautionnaire|caution|garant|candidat)\s*2/.test(local)) x2 = bits[i].x
+      const m = local.match(new RegExp(`${role}\\s*(\\d)`))
+      if (!m) continue
+      const n = Number(m[1])
+      if (!found.some((f) => f.n === n)) found.push({ n, x: bits[i].x })
     }
-    if (x1 != null && x2 != null && x2 > x1 + Math.max(90, pageW * 0.28)) {
-      return Math.round((x1 + x2) / 2)
+    found.sort((a, b) => a.n - b.n || a.x - b.x)
+    if (found.length >= 2 && found[found.length - 1].x > found[0].x + Math.max(80, pageW * 0.22)) {
+      const splits: number[] = []
+      for (let i = 0; i < found.length - 1; i += 1) {
+        splits.push(Math.round((found[i].x + found[i + 1].x) / 2))
+      }
+      return { splits, headers: found.map((f) => f.x) }
     }
   }
 
@@ -808,12 +852,16 @@ function findColumnSplit(lines: PdfLine[], pageW: number, pageText: string): num
       }
     }
   }
-  if (votes >= 2) return Math.round(splitSum / votes)
+  if (votes >= 2) return { splits: [Math.round(splitSum / votes)], headers: [] }
+
+  const stacked = lines.filter((l) => /(?:locataire|cautionnaire|caution|garant|candidat)\s*\d/.test(normalizeText(l.text)))
+  const stackedBands = new Set(stacked.map((l) => Math.round(l.y / 8)))
+  if (stackedBands.size >= 2) return { splits: [], headers: [] }
 
   if (pageHasTwoColumns('tenant-form', pageText) || pageHasTwoColumns('guarantor-form', pageText)) {
-    return Math.round(pageW * 0.5)
+    return { splits: [Math.round(pageW * 0.5)], headers: [] }
   }
-  return null
+  return { splits: [], headers: [] }
 }
 
 function pageHasTwoColumns(kind: PdfPageKind, pageText: string): boolean {
@@ -824,6 +872,38 @@ function pageHasTwoColumns(kind: PdfPageKind, pageText: string): boolean {
   return false
 }
 
+function applySectionRoles(
+  fields: DetectedField[],
+  lines: PdfLine[],
+  pageIndex: number,
+  pageKind: PdfPageKind,
+  splits: number[],
+): DetectedField[] {
+  if (splits.length) return fields
+  const heads: { n: number; y: number; guarantor: boolean }[] = []
+  for (const line of lines) {
+    const n = normalizeText(line.text)
+    const m = n.match(/(?:locataire|cautionnaire|caution|garant|candidat)\s*(\d)/)
+    if (!m) continue
+    const g = /cautionnaire|caution|garant/.test(n) && !/locataire/.test(n)
+    heads.push({ n: Number(m[1]), y: line.y, guarantor: g })
+  }
+  const bands = new Set(heads.map((h) => Math.round(h.y / 6)))
+  if (heads.length < 2 || bands.size < 2) return fields
+  return fields.map((f) => {
+    if (Number(f.raw.page) !== pageIndex) return f
+    const fy = Number(f.raw.y)
+    const above = heads.filter((h) => h.y > fy - 6).sort((a, b) => a.y - b.y)[0]
+    if (!above) return f
+    const slot = Math.max(0, above.n - 1)
+    if (above.guarantor || pageKind === 'guarantor-form') {
+      return { ...f, tenantHint: slot, roleHint: 'guarantor' }
+    }
+    if (slot >= 1) return { ...f, tenantHint: slot, roleHint: 'cotenant' }
+    return { ...f, tenantHint: 0, roleHint: 'primary' }
+  })
+}
+
 function hintsForPage(
   kind: PdfPageKind,
   slot: number,
@@ -831,8 +911,8 @@ function hintsForPage(
   if (kind === 'guarantor-form' || kind === 'guarantor-docs') {
     return { tenantHint: slot, roleHint: 'guarantor' }
   }
-  if (kind === 'tenant-form' && slot === 1) {
-    return { tenantHint: 1, roleHint: 'cotenant' }
+  if (kind === 'tenant-form' && slot >= 1) {
+    return { tenantHint: slot, roleHint: 'cotenant' }
   }
   return { tenantHint: 0, roleHint: 'primary' }
 }
@@ -858,7 +938,7 @@ function nearestSection(rect: PdfWidget['rect'], lines: PdfLine[]): string {
   const above = lines
     .filter((l) => l.y > rect.y2 + 8 && l.y < rect.y2 + 220 && l.text.length < 50)
     .sort((a, b) => a.y - b.y)
-  const heading = [...above].reverse().find((l) => {
+  const heading = above.find((l) => {
     const t = l.text
     return (
       /^[A-ZÉÈÀÂÊÎÔÛÙÇ0-9 \-']{4,}$/.test(t) ||

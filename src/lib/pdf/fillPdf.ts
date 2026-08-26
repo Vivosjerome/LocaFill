@@ -38,6 +38,14 @@ export async function fillPdfForm(
     if (drawOverlay(pages, font, rgb, field, value)) written.add(field.id)
   }
 
+  if (form) {
+    try {
+      form.flatten()
+    } catch {
+      /* keep interactive fields */
+    }
+  }
+
   let bytes: Uint8Array
   try {
     bytes = await doc.save({ updateFieldAppearances: Boolean(form && written.size) })
@@ -112,13 +120,24 @@ function drawOverlay(
       }
       return true
     }
-    const fitted = layoutOverlayText(text, font, maxW - 4, boxH)
+    const fitted = layoutOverlayText(text, font, Math.max(12, maxW - 1), boxH)
     if (!fitted.lines.length) return false
-    const lineH = fitted.size + 1.4
+    const padX = field.raw.kind === 'box' ? 3 : 0.6
+    const lineH = fitted.size + 1.2
+    const white = rgb(1, 1, 1)
     fitted.lines.forEach((line, i) => {
+      const ty = Math.max(4, y - i * lineH)
+      const tw = font.widthOfTextAtSize(line, fitted.size)
+      page.drawRectangle({
+        x: x + padX - 0.5,
+        y: ty - 1.4,
+        width: tw + 2,
+        height: fitted.size + 2.4,
+        color: white,
+      })
       page.drawText(line, {
-        x: x + 2,
-        y: Math.max(4, y - i * lineH),
+        x: x + padX,
+        y: ty,
         size: fitted.size,
         font,
         color,
@@ -136,10 +155,11 @@ function layoutOverlayText(
   maxW: number,
   boxH: number,
 ): { lines: string[]; size: number } {
-  let size = Math.min(10, Math.max(7, boxH * 0.78))
-  const minSize = 6
-  while (size > minSize && font.widthOfTextAtSize(text, size) > maxW) size -= 0.5
-  if (font.widthOfTextAtSize(text, size) <= maxW) return { lines: [text], size }
+  const singleLine = boxH < 16
+  let size = Math.min(10.5, Math.max(8, boxH >= 14 ? Math.min(11, boxH * 0.68) : 9.2))
+  const minSize = singleLine ? 6 : 7.5
+  while (size > minSize && font.widthOfTextAtSize(text, size) > maxW) size -= 0.4
+  if (singleLine || font.widthOfTextAtSize(text, size) <= maxW) return { lines: [text], size }
 
   const wrapped = wrapOverlayLine(text, font, size, maxW)
   if (wrapped.length <= 2) return { lines: wrapped, size }

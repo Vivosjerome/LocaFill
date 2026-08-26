@@ -10,6 +10,8 @@ lerna-debug.log*
 node_modules
 dist
 fixtures/*.pdf
+fixtures/filled/
+fixtures/debug/
 *.local
 
 # Editor directories and files
