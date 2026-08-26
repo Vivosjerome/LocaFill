@@ -11,16 +11,14 @@ import { normalizeText } from './normalize'
 export function resolveTenantIndex(field: DetectedField, profile: AppProfile): number | null {
   if (field.roleHint === 'guarantor') {
     const idxs = roleIndices(profile, 'guarantor')
-    const slot = field.tenantHint >= 2 ? 0 : Math.max(0, field.tenantHint)
+    const slot = Math.max(0, field.tenantHint)
     return idxs[slot] ?? null
   }
-  if (field.roleHint === 'cotenant') {
-    const idxs = roleIndices(profile, 'cotenant')
-    const slot = field.tenantHint > 0 ? field.tenantHint - 1 : 0
-    return idxs[slot] ?? null
+  const occupants = profile.tenants.flatMap((t, i) => (t.role === 'guarantor' ? [] : [i]))
+  if (field.roleHint === 'cotenant' || field.tenantHint >= 1) {
+    return occupants[1] ?? null
   }
-  const primary = profile.tenants.findIndex((t) => t.role === 'primary')
-  return primary >= 0 ? primary : 0
+  return occupants[0] ?? (profile.tenants[0] ? 0 : null)
 }
 
 function roleIndices(profile: AppProfile, role: TenantRole): number[] {

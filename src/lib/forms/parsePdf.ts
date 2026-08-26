@@ -116,7 +116,8 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
     if (pageKind === 'skip') continue
 
     const pageW = page.view[2] - page.view[0]
-    const twoCols = pageHasTwoColumns(pageKind, pageText)
+    const colSplit = findColumnSplit(lines, pageW, pageText)
+    const twoCols = colSplit != null
     const docPage = pageKind === 'tenant-docs' || pageKind === 'guarantor-docs'
 
     const annotations = await page.getAnnotations()
@@ -141,7 +142,7 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
       if (item.kind === 'text' && isMaritalDetailLabel(label)) continue
       if (pageKind === 'employer-letter' && isEmployerSignatoryLabel(label)) continue
 
-      const slot = twoCols && item.widget.rect.x1 > pageW * 0.48 ? 1 : 0
+      const slot = twoCols && item.widget.rect.x1 >= (colSplit ?? pageW * 0.5) ? 1 : 0
       const tenant = hintsForPage(pageKind, slot)
 
       fields.push({
@@ -179,6 +180,7 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
           twoCols,
           occupied: pending.map((p) => p.widget.rect),
           guides,
+          colSplit,
         }),
       )
     }
@@ -531,22 +533,23 @@ function extractLayoutFields(input: {
   twoCols: boolean
   occupied: PdfWidget['rect'][]
   guides: { lines: FillZone[]; boxes: FillZone[] }
+  colSplit: number | null
 }): DetectedField[] {
-  const { lines, pageIndex, pageW, pageKind, twoCols, occupied, guides } = input
+  const { lines, pageIndex, pageW, pageKind, occupied, guides, colSplit } = input
   const fields: DetectedField[] = []
   const textLeaders = lines.flatMap(leaderZonesFromLine)
-  const allLines = mergeZones([...guides.lines, ...textLeaders], 10)
-  const boxes = guides.boxes
+  const allLines = splitAcrossColumn(mergeZones([...guides.lines, ...textLeaders], 6), colSplit)
+  const boxes = splitAcrossColumn(guides.boxes, colSplit)
 
   const taken = (x: number, y: number) =>
     occupied.some((r) => x >= r.x1 - 8 && x <= r.x2 + 8 && y >= r.y1 - 8 && y <= r.y2 + 8)
 
-  const colEnd = (x: number) => (twoCols && x < pageW * 0.48 ? pageW * 0.48 - 10 : pageW - 16)
+  const colEnd = (x: number) => (colSplit != null && x < colSplit ? colSplit - 10 : pageW - 16)
 
   const labelBits = (line: PdfLine) =>
     line.bits.filter((b) => !isLeaderText(b.str) && b.str.replace(/[.\-_·•…]/g, '').trim().length > 0)
 
-  const push = (label: string, zone: FillZone, nearby: string) => {
+  const push = (label: string, zone: FillZone, nearby: string, labelX: number) => {
     const cleaned = cleanLabel(label.replace(/[.\-_·•…]{2,}/g, ' '))
     if (!cleaned || isNoisePdfLabel(cleaned) || isSectionHeading(cleaned) || isDocumentChecklist(cleaned)) return
     if (!looksLikeFieldLabel(cleaned)) return
@@ -555,7 +558,7 @@ function extractLayoutFields(input: {
     const w = zone.x2 - zone.x1 - 4
     const y = zone.y + Math.min(3, zone.h * 0.25)
     if (taken(x, y) || w < 18) return
-    const slot = twoCols && x > pageW * 0.48 ? 1 : 0
+    const slot = colSplit != null && labelX >= colSplit ? 1 : 0
     const tenant = hintsForPage(pageKind, slot)
     occupied.push({ x1: zone.x1, y1: zone.y - 4, x2: zone.x2, y2: zone.y + zone.h + 4 })
     fields.push({
@@ -579,22 +582,30 @@ function extractLayoutFields(input: {
 
   const zoneFor = (labelEnd: number, labelY: number, left: number): FillZone | null => {
     const right = colEnd(left)
-    const onRow = (z: FillZone) => Math.abs(z.y - labelY) <= 9 && z.x2 > labelEnd + 6 && z.x1 < right + 8
+    const sameCol = (z: FillZone) =>
+      colSplit == null || (left < colSplit ? z.x2 <= colSplit + 8 : z.x1 >= colSplit - 8)
+    const onRow = (z: FillZone) =>
+      sameCol(z) && Math.abs(z.y - labelY) <= 9 && z.x2 > labelEnd + 6 && z.x1 < right + 8
     const rowLeaders = allLines.filter((z) => onRow(z) && z.x1 >= labelEnd - 12).sort((a, b) => a.x1 - b.x1)
     if (rowLeaders[0]) {
       const z = rowLeaders[0]
-      return { ...z, x1: Math.max(z.x1, labelEnd + 2) }
+      return { ...z, x1: Math.max(z.x1, labelEnd + 2), x2: Math.min(z.x2, right) }
     }
     const rowBox = boxes
-      .filter((z) => Math.abs(z.y + z.h / 2 - labelY) <= 12 && z.x1 >= labelEnd - 8 && z.x1 < right)
+      .filter((z) => sameCol(z) && Math.abs(z.y + z.h / 2 - labelY) <= 12 && z.x1 >= labelEnd - 8 && z.x1 < right)
       .sort((a, b) => a.x1 - b.x1)[0]
-    if (rowBox) return { x1: rowBox.x1 + 2, x2: rowBox.x2 - 2, y: rowBox.y + 2, h: rowBox.h }
+    if (rowBox) return { x1: rowBox.x1 + 2, x2: Math.min(rowBox.x2 - 2, right), y: rowBox.y + 2, h: rowBox.h }
     const below = [...allLines, ...boxes]
-      .filter((z) => z.y < labelY - 1 && labelY - z.y < 22 && z.x2 > labelEnd - 20 && z.x1 < right)
+      .filter((z) => sameCol(z) && z.y < labelY - 1 && labelY - z.y < 22 && z.x2 > labelEnd - 20 && z.x1 < right)
       .sort((a, b) => labelY - (a.y + (a.h || 0)) - (labelY - (b.y + (b.h || 0))) || a.x1 - b.x1)
     if (below[0]) {
       const z = below[0]
-      return { x1: Math.min(Math.max(z.x1, left), z.x2 - 24), x2: Math.min(z.x2, right), y: z.y + 2, h: Math.max(z.h, 9) }
+      return {
+        x1: Math.min(Math.max(z.x1, left), z.x2 - 24),
+        x2: Math.min(z.x2, right),
+        y: z.y + 2,
+        h: Math.max(z.h, 9),
+      }
     }
     return null
   }
@@ -624,7 +635,7 @@ function extractLayoutFields(input: {
           zone = { x1: end + 16, x2: nextX - 8, y: line.y, h: Math.max(line.h, 10) }
         }
       }
-      if (zone) push(label, zone, line.text)
+      if (zone) push(label, zone, line.text, group[0].x)
     }
   }
 
@@ -693,6 +704,67 @@ function bitsToTheRight(rect: PdfWidget['rect'], lines: PdfLine[]): string {
     if (text.replace(/\s/g, '').length > 18) break
   }
   return text.replace(/\s+/g, ' ').trim()
+}
+
+function splitAcrossColumn(zones: FillZone[], split: number | null): FillZone[] {
+  if (split == null) return zones
+  const out: FillZone[] = []
+  for (const z of zones) {
+    if (z.x1 < split - 6 && z.x2 > split + 6) {
+      out.push({ ...z, x2: split - 6 })
+      out.push({ ...z, x1: split + 6 })
+    } else {
+      out.push(z)
+    }
+  }
+  return out.filter((z) => z.x2 - z.x1 >= 16)
+}
+
+function findColumnSplit(lines: PdfLine[], pageW: number, pageText: string): number | null {
+  for (const line of lines) {
+    const n = normalizeText(line.text)
+    const has1 = /(?:locataire|cautionnaire|caution|garant|candidat)\s*1/.test(n)
+    const has2 = /(?:locataire|cautionnaire|caution|garant|candidat)\s*2/.test(n)
+    if (!has1 || !has2) continue
+    let x1: number | undefined
+    let x2: number | undefined
+    const bits = line.bits
+    for (let i = 0; i < bits.length; i += 1) {
+      const local = normalizeText(bits.slice(i, i + 4).map((b) => b.str).join(' '))
+      if (x1 == null && /(?:locataire|cautionnaire|caution|garant|candidat)\s*1/.test(local)) x1 = bits[i].x
+      if (/(?:locataire|cautionnaire|caution|garant|candidat)\s*2/.test(local)) x2 = bits[i].x
+    }
+    if (x1 != null && x2 != null && x2 > x1 + 40) return Math.round((x1 + x2) / 2)
+  }
+
+  let votes = 0
+  let splitSum = 0
+  for (const line of lines) {
+    const useful = line.bits.filter((b) => !isLeaderText(b.str) && b.str.trim())
+    if (useful.length < 2) continue
+    const groups: PdfBit[][] = [[useful[0]]]
+    for (const bit of useful.slice(1)) {
+      const cur = groups[groups.length - 1]
+      const prev = cur[cur.length - 1]
+      if (bit.x - (prev.x + prev.w) < 16) cur.push(bit)
+      else groups.push([bit])
+    }
+    const labeled = groups.filter((g) => looksLikeFieldLabel(g.map((b) => b.str).join(' ')))
+    if (labeled.length >= 2) {
+      const a = labeled[0][0].x
+      const b = labeled[1][0].x
+      if (b - a > pageW * 0.28) {
+        votes += 1
+        splitSum += (a + b) / 2
+      }
+    }
+  }
+  if (votes >= 2) return Math.round(splitSum / votes)
+
+  if (pageHasTwoColumns('tenant-form', pageText) || pageHasTwoColumns('guarantor-form', pageText)) {
+    return Math.round(pageW * 0.5)
+  }
+  return null
 }
 
 function pageHasTwoColumns(kind: PdfPageKind, pageText: string): boolean {

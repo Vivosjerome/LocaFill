@@ -67,14 +67,19 @@ export type PdfPageKind =
   | 'skip'
 
 export function classifyPdfPage(pageText: string): PdfPageKind {
-  const n = normalizeText(pageText.slice(0, 480))
+  const n = normalizeText(pageText.slice(0, 1600))
   if (/rgpd|responsable du traitement/.test(n)) return 'skip'
   if (/attestation d hebergement|attestation de rattachement|foyer fiscal/.test(n)) return 'skip'
   if (/attestation employeur/.test(n)) return 'employer-letter'
   if (/pieces a fournir/.test(n) && /garant|caution/.test(n)) return 'guarantor-docs'
   if (/pieces a fournir/.test(n)) return 'tenant-docs'
-  if (/fiche de renseignements/.test(n) && /caution/.test(n)) return 'guarantor-form'
-  if (/fiche de renseignements/.test(n)) return 'tenant-form'
+  const hasCautionCols = /cautionnaire\s*[12]|caution\s*[12]|garant\s*[12]/.test(n)
+  const hasTenantCols = /locataire\s*[12]/.test(n)
+  if (hasCautionCols && !hasTenantCols) return 'guarantor-form'
+  if (/fiche de renseignements/.test(n) && /caution|garant/.test(n) && !hasTenantCols) {
+    return 'guarantor-form'
+  }
+  if (hasTenantCols || /fiche de renseignements/.test(n)) return 'tenant-form'
   return 'tenant-form'
 }
 
