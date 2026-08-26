@@ -186,7 +186,11 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
     }
   }
 
-  return { fields: dedupeFields(fields), text: textParts.join('\n\n'), pageCount: pdf.numPages }
+  return {
+    fields: applyDuplicateIdentityPages(dedupeFields(fields), textParts),
+    text: textParts.join('\n\n'),
+    pageCount: pdf.numPages,
+  }
 }
 
 async function extractPdfFieldsPdfLib(data: ArrayBuffer): Promise<{
@@ -704,6 +708,26 @@ function bitsToTheRight(rect: PdfWidget['rect'], lines: PdfLine[]): string {
     if (text.replace(/\s/g, '').length > 18) break
   }
   return text.replace(/\s+/g, ' ').trim()
+}
+
+function applyDuplicateIdentityPages(fields: DetectedField[], textParts: string[]): DetectedField[] {
+  const identityPages: number[] = []
+  textParts.forEach((text, idx) => {
+    const n = normalizeText(text)
+    if (classifyPdfPage(text) !== 'tenant-form') return
+    if (/locataire\s*1/.test(n) && /locataire\s*2/.test(n) && /situation personnelle/.test(n)) return
+    if (/nom/.test(n) && /naissance/.test(n)) identityPages.push(idx + 1)
+  })
+  if (identityPages.length < 2) return fields
+  const slotOf = new Map(identityPages.map((page, slot) => [page, slot]))
+  return fields.map((field) => {
+    const page = Number(field.raw.page || '0')
+    const slot = slotOf.get(page)
+    if (slot == null || slot === 0) return field
+    if (field.roleHint === 'guarantor') return field
+    const tenant = hintsForPage('tenant-form', slot)
+    return { ...field, tenantHint: tenant.tenantHint, roleHint: tenant.roleHint }
+  })
 }
 
 function splitAcrossColumn(zones: FillZone[], split: number | null): FillZone[] {

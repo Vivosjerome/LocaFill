@@ -75,6 +75,7 @@ export function classifyPdfPage(pageText: string): PdfPageKind {
   if (/pieces a fournir/.test(n)) return 'tenant-docs'
   const hasCautionCols = /cautionnaire\s*[12]|caution\s*[12]|garant\s*[12]/.test(n)
   const hasTenantCols = /locataire\s*[12]/.test(n)
+  if (/candidature\s+garants?\b/.test(n) && !/candidature\s+locataires/.test(n)) return 'guarantor-form'
   if (hasCautionCols && !hasTenantCols) return 'guarantor-form'
   if (/fiche de renseignements/.test(n) && /caution|garant/.test(n) && !hasTenantCols) {
     return 'guarantor-form'

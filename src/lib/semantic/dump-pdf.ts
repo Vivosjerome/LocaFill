@@ -104,11 +104,17 @@ if (!mapped.some((m) => fieldOf(m)?.label === 'Nom & Prénom' && fieldOf(m)?.rol
 if (mapped.some((m) => fieldOf(m)?.label === 'Nom du locataire' && m.displayValue === 'X')) {
   fail.push('Nom du locataire ne doit pas prendre le nom du co-locataire')
 }
-if (!mapped.some((m) => fieldOf(m)?.label === 'Nom du locataire' && m.displayValue === 'VIVOS')) {
-  fail.push('Nom du locataire doit être VIVOS')
+if (!mapped.some((m) => fieldOf(m)?.label === 'Nom & Prénom' && fieldOf(m)?.roleHint === 'cotenant' && /Laurine/i.test(m.displayValue))) {
+  fail.push('Nom locataire 2 doit être Laurine')
 }
-if (!mapped.some((m) => fieldOf(m)?.label === 'Nom du garant' && /Lys/i.test(m.displayValue))) {
+if (mapped.some((m) => fieldOf(m)?.roleHint === 'cotenant' && /VIVOS|Jerome/i.test(m.displayValue))) {
+  fail.push('La colonne locataire 2 ne doit pas recevoir Jerome/VIVOS')
+}
+if (!mapped.some((m) => fieldOf(m)?.label === 'Nom & Prénom' && fieldOf(m)?.roleHint === 'guarantor' && /Lys/i.test(m.displayValue))) {
   fail.push('Nom du garant doit être Lys')
+}
+if (mapped.some((m) => fieldOf(m)?.roleHint === 'guarantor' && /Jerome|VIVOS/i.test(m.displayValue))) {
+  fail.push('La fiche cautionnaire ne doit pas recevoir Jerome/VIVOS')
 }
 if (mapped.some((m) => fieldOf(m)?.label === 'Nom & Prénom' && fieldOf(m)?.raw.page === '1' && m.displayValue === 'Lys')) {
   fail.push('La fiche locataire ne doit pas recevoir le nom du garant')
