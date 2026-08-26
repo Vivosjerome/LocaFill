@@ -65,7 +65,7 @@ export async function analyzeSource(input: {
         extracted = await extractPdfFields(buffer)
       } catch (e) {
         const detail = e instanceof Error ? e.message : 'erreur inconnue'
-        throw new Error(`Impossible de lire ce PDF (${detail}). Réessaie, ou utilise un PDF remplissable (pas un scan).`)
+        throw new Error(`Impossible de lire ce PDF (${detail}).`)
       }
       fields = extracted.fields
       originalText = extracted.text
@@ -101,7 +101,7 @@ export async function analyzeSource(input: {
   if (!fields.length) {
     throw new Error(
       sourceKind === 'pdf'
-        ? 'Aucun champ remplissable dans ce PDF. Un scan ou un PDF « photo » ne peut pas être rempli comme un formulaire — il faut le PDF de l’agence avec les cases à saisir.'
+        ? 'Aucun champ détecté sur ce PDF. Réessaie avec le fichier de l’agence (même sans cases à cliquer, le texte du formulaire suffit).'
         : 'Aucun champ trouvé. Collez les libellés du formulaire (Nom, Prénom, e-mail…) ou le HTML de la page — pas seulement une URL ou un paragraphe.',
     )
   }

@@ -89,8 +89,13 @@ export function PreviewPage() {
     const timer = window.setTimeout(() => {
       void (async () => {
         try {
-          const blob = await fillPdfForm(session.originalPdf!, session.fields, session.mappings)
-          const pages = await renderPdfPages(await blob.arrayBuffer(), 12)
+          let blob = session.originalPdf!
+          try {
+            blob = await fillPdfForm(session.originalPdf!, session.fields, session.mappings)
+          } catch {
+            blob = session.originalPdf!
+          }
+          const pages = await renderPdfPages(await blob.arrayBuffer(), 24)
           if (cancelled) return
           pageUrls.current.forEach((u) => URL.revokeObjectURL(u))
           const urls = pages.map((p) => URL.createObjectURL(p))
@@ -165,8 +170,8 @@ export function PreviewPage() {
       <div className="page-head">
         <h1>Prévisualisation</h1>
         <p className="lede">
-          Cliquez sur une pastille pour n’afficher que ces champs. Recliquez pour tout réafficher, ou ajoutez-en une
-          autre.
+          Cliquez sur une pastille pour n’afficher que ces champs. Sur un PDF sans cases à remplir, LocaFill
+          écrit les infos par-dessus le document — vous les voyez sur l’aperçu.
         </p>
         <div className="fill-legend" role="group" aria-label="Filtrer les champs">
           <button
@@ -289,7 +294,7 @@ export function PreviewPage() {
 
       <div className="row" style={{ marginTop: 16 }}>
         <button type="button" className="btn btn-accent" onClick={() => void fillForm()}>
-          {session.originalPdf ? 'Télécharger le PDF rempli' : 'Remplir le formulaire'}
+          {session.originalPdf ? 'Télécharger le PDF annoté' : 'Remplir le formulaire'}
         </button>
         <Link to="/analyzer" className="btn btn-ghost">
           Nouvelle analyse

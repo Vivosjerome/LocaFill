@@ -23,9 +23,27 @@ export async function ocrBlob(
   blob: Blob,
   onProgress?: (status: string, progress: number) => void,
 ): Promise<string> {
+  const { text } = await ocrLayout(blob, onProgress)
+  return text
+}
+
+export async function ocrLayout(
+  blob: Blob,
+  onProgress?: (status: string, progress: number) => void,
+): Promise<{ text: string; words: { str: string; x0: number; y0: number; x1: number; y1: number }[] }> {
   const worker = await getWorker(onProgress)
   const { data } = await worker.recognize(blob)
-  return data.text ?? ''
+  const words = ((data as { words?: { text?: string; bbox?: { x0: number; y0: number; x1: number; y1: number } }[] })
+    .words ?? [])
+    .filter((w) => w.text?.trim() && w.bbox)
+    .map((w) => ({
+      str: w.text!.trim(),
+      x0: w.bbox!.x0,
+      y0: w.bbox!.y0,
+      x1: w.bbox!.x1,
+      y1: w.bbox!.y1,
+    }))
+  return { text: data.text ?? '', words }
 }
 
 export function classifyDocument(text: string, fileName: string): { kind: DocumentKind; confidence: number } {

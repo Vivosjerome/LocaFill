@@ -10,6 +10,7 @@ import {
   isSectionHeading,
   type PdfPageKind,
 } from '@/lib/forms/pdfLabels'
+import { ocrLayout } from '@/lib/ocr'
 import { normalizeText } from '@/lib/semantic/normalize'
 import type * as PdfJs from 'pdfjs-dist'
 
@@ -158,13 +159,26 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
         required: false,
         tenantHint: tenant.tenantHint,
         roleHint: tenant.roleHint,
-        raw: {
-          fieldName: item.widget.fieldName,
-          page: String(i),
-          acrobat: item.widget.fieldName,
-          x: String(Math.round(item.widget.rect.x1)),
-        },
+        raw: overlayRaw(i, item.widget.rect.x1, item.widget.rect.y1 + 2, item.widget.rect.x2 - item.widget.rect.x1, item.widget.rect.y2 - item.widget.rect.y1, item.widget.fieldName),
       })
+    }
+
+    if (!docPage) {
+      let layoutLines = lines
+      if (pageText.replace(/\s/g, '').length < 40 && typeof document !== 'undefined') {
+        const ocrLines = await linesFromOcrPage(page)
+        if (ocrLines.length) layoutLines = ocrLines
+      }
+      fields.push(
+        ...extractLayoutFields({
+          lines: layoutLines,
+          pageIndex: i,
+          pageW,
+          pageKind,
+          twoCols,
+          occupied: pending.map((p) => p.widget.rect),
+        }),
+      )
     }
   }
 
@@ -264,7 +278,7 @@ function readWidget(annot: unknown): PdfWidget | null {
 }
 
 function clusterLines(content: { items: unknown[] }): PdfLine[] {
-  const bits: { str: string; x: number; y: number; w: number; h: number }[] = []
+  const bits: PdfBit[] = []
   for (const item of content.items) {
     if (!item || typeof item !== 'object' || !('str' in item)) continue
     const it = item as { str: string; transform: number[]; width: number; height: number }
@@ -279,8 +293,11 @@ function clusterLines(content: { items: unknown[] }): PdfLine[] {
       h: it.height || Math.abs(t[3]) || 10,
     })
   }
+  return clusterBits(bits)
+}
 
-  const buckets: { y: number; bits: typeof bits }[] = []
+function clusterBits(bits: PdfBit[]): PdfLine[] {
+  const buckets: { y: number; bits: PdfBit[] }[] = []
   for (const bit of bits.sort((a, b) => b.y - a.y || a.x - b.x)) {
     const bucket = buckets.find((b) => Math.abs(b.y - bit.y) < 3.2)
     if (bucket) {
@@ -294,7 +311,7 @@ function clusterLines(content: { items: unknown[] }): PdfLine[] {
   return buckets.map((bucket) => {
     const ordered = bucket.bits.sort((a, b) => a.x - b.x)
     let text = ''
-    let prev: (typeof bits)[number] | null = null
+    let prev: PdfBit | null = null
     for (const bit of ordered) {
       if (prev && bit.x - (prev.x + prev.w) > 1.1) text += ' '
       text += bit.str
@@ -310,6 +327,128 @@ function clusterLines(content: { items: unknown[] }): PdfLine[] {
       bits: ordered,
     }
   })
+}
+
+async function linesFromOcrPage(page: PdfJs.PDFPageProxy): Promise<PdfLine[]> {
+  const scale = 2
+  const viewport = page.getViewport({ scale })
+  const canvas = document.createElement('canvas')
+  canvas.width = viewport.width
+  canvas.height = viewport.height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return []
+  await page.render({ canvas, canvasContext: ctx, viewport }).promise
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
+  if (!blob) return []
+  const { words } = await ocrLayout(blob)
+  const pageH = page.view[3] - page.view[1]
+  const bits: PdfBit[] = words.map((w) => ({
+    str: w.str,
+    x: w.x0 / scale,
+    y: pageH - w.y1 / scale,
+    w: Math.max(2, (w.x1 - w.x0) / scale),
+    h: Math.max(6, (w.y1 - w.y0) / scale),
+  }))
+  return clusterBits(bits)
+}
+
+function overlayRaw(
+  page: number,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  fieldName = '',
+): Record<string, string> {
+  return {
+    fieldName,
+    page: String(page),
+    acrobat: fieldName,
+    x: String(Math.round(x)),
+    y: String(Math.round(y)),
+    w: String(Math.round(Math.max(24, w))),
+    h: String(Math.round(Math.max(8, h))),
+    overlay: '1',
+  }
+}
+
+function extractLayoutFields(input: {
+  lines: PdfLine[]
+  pageIndex: number
+  pageW: number
+  pageKind: PdfPageKind
+  twoCols: boolean
+  occupied: PdfWidget['rect'][]
+}): DetectedField[] {
+  const { lines, pageIndex, pageW, pageKind, twoCols, occupied } = input
+  const fields: DetectedField[] = []
+
+  const taken = (x: number, y: number) =>
+    occupied.some((r) => x >= r.x1 - 10 && x <= r.x2 + 10 && y >= r.y1 - 10 && y <= r.y2 + 10)
+
+  const colEnd = (x: number) => (twoCols && x < pageW * 0.48 ? pageW * 0.48 - 12 : pageW - 18)
+
+  const push = (label: string, x: number, y: number, w: number, h: number, nearby: string) => {
+    const cleaned = cleanLabel(label)
+    if (!cleaned || isNoisePdfLabel(cleaned) || isSectionHeading(cleaned) || isDocumentChecklist(cleaned)) return
+    if (!looksLikeFieldLabel(cleaned)) return
+    if (isMaritalDetailLabel(cleaned) || isEmployerSignatoryLabel(cleaned)) return
+    if (taken(x, y) || w < 22) return
+    const slot = twoCols && x > pageW * 0.48 ? 1 : 0
+    const tenant = hintsForPage(pageKind, slot)
+    occupied.push({ x1: x, y1: y - 4, x2: x + w, y2: y + h + 4 })
+    fields.push({
+      id: `pdf_overlay_${pageIndex}_${Math.round(x)}_${Math.round(y)}_${fields.length}`,
+      name: `overlay:${pageIndex}:${Math.round(x)}:${Math.round(y)}`,
+      htmlId: '',
+      type: 'text',
+      tag: 'pdf-overlay',
+      label: cleaned,
+      placeholder: '',
+      autocomplete: '',
+      nearbyText: nearby,
+      section: nearestSection({ x1: x, y1: y, x2: x + w, y2: y + h }, lines) || `Page ${pageIndex}`,
+      options: [],
+      required: false,
+      tenantHint: tenant.tenantHint,
+      roleHint: tenant.roleHint,
+      raw: overlayRaw(pageIndex, x, y, w, h),
+    })
+  }
+
+  for (const line of lines) {
+    const bits = line.bits
+    if (!bits.length) continue
+
+    for (let i = 0; i < bits.length; i += 1) {
+      const next = bits[i + 1]
+      const gap = next ? next.x - (bits[i].x + bits[i].w) : colEnd(bits[i].x) - (bits[i].x + bits[i].w)
+      if (gap < 26) continue
+      const left = bits
+        .slice(0, i + 1)
+        .map((b) => b.str)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+      if (!looksLikeFieldLabel(left)) continue
+      push(left, bits[i].x + bits[i].w + 4, line.y, gap - 8, line.h, line.text)
+    }
+
+    const trimmed = line.text.replace(/[_\.…]{3,}/g, '').trim()
+    if (
+      looksLikeFieldLabel(trimmed) &&
+      line.x2 < colEnd(line.x1) - 40 &&
+      bits.length <= 8
+    ) {
+      const x = line.x2 + 8
+      const w = colEnd(line.x1) - x
+      if (w >= 28 && !line.text.match(/[_\.…]{6,}/)) {
+        push(trimmed, x, line.y, w, line.h, line.text)
+      }
+    }
+  }
+
+  return fields
 }
 
 function resolvePdfLabel(widget: PdfWidget, lines: PdfLine[], kind: 'text' | 'checkbox'): string {
