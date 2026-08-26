@@ -58,20 +58,30 @@ export async function analyzeSource(input: {
     const file = input.file
     if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
       input.onProgress?.('Extraction des champs PDF…')
-      const buffer = await file.arrayBuffer()
-      const extracted = await extractPdfFields(buffer)
+      originalPdf = file.slice(0, file.size, file.type || 'application/pdf')
+      const buffer = await originalPdf.arrayBuffer()
+      let extracted: Awaited<ReturnType<typeof extractPdfFields>>
+      try {
+        extracted = await extractPdfFields(buffer)
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : 'erreur inconnue'
+        throw new Error(`Impossible de lire ce PDF (${detail}). Réessaie, ou utilise un PDF remplissable (pas un scan).`)
+      }
       fields = extracted.fields
       originalText = extracted.text
-      originalPdf = file
       if (!fields.length) {
-        input.onProgress?.('Aucun libellé PDF : OCR des pages…')
-        const pages = await renderPdfPages(buffer)
-        const texts: string[] = []
-        for (const page of pages) {
-          texts.push(await ocrBlob(page, (s, p) => input.onProgress?.(`OCR ${s} ${Math.round(p * 100)}%`)))
+        input.onProgress?.('Aucun champ remplissable : OCR des pages…')
+        try {
+          const pages = await renderPdfPages(buffer, 12)
+          const texts: string[] = []
+          for (const page of pages) {
+            texts.push(await ocrBlob(page, (s, p) => input.onProgress?.(`OCR ${s} ${Math.round(p * 100)}%`)))
+          }
+          originalText = texts.join('\n')
+          fields = extractFieldsFromText(originalText)
+        } catch {
+          /* OCR optional */
         }
-        originalText = texts.join('\n')
-        fields = extractFieldsFromText(originalText)
       }
       sourceKind = 'pdf'
     } else if (file.type.includes('html') || file.name.endsWith('.html') || file.name.endsWith('.htm')) {
@@ -90,7 +100,9 @@ export async function analyzeSource(input: {
 
   if (!fields.length) {
     throw new Error(
-      'Aucun champ trouvé. Collez les libellés du formulaire (Nom, Prénom, e-mail…) ou le HTML de la page — pas seulement une URL ou un paragraphe.',
+      sourceKind === 'pdf'
+        ? 'Aucun champ remplissable dans ce PDF. Un scan ou un PDF « photo » ne peut pas être rempli comme un formulaire — il faut le PDF de l’agence avec les cases à saisir.'
+        : 'Aucun champ trouvé. Collez les libellés du formulaire (Nom, Prénom, e-mail…) ou le HTML de la page — pas seulement une URL ou un paragraphe.',
     )
   }
 
@@ -114,7 +126,12 @@ export async function analyzeSource(input: {
     originalPdf,
   }
 
-  await saveSession(session)
+  try {
+    await saveSession(session)
+  } catch {
+    const { originalPdf: _pdf, ...lite } = session
+    await saveSession(lite)
+  }
   return session
 }
 

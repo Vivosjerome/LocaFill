@@ -19,24 +19,35 @@ async function pdfjs(): Promise<typeof PdfJs> {
   if (!pdfjsPromise) {
     pdfjsPromise = (async () => {
       const isNode = typeof window === 'undefined'
-      const lib = isNode
-        ? ((await import('pdfjs-dist/legacy/build/pdf.mjs')) as unknown as typeof PdfJs)
-        : await import('pdfjs-dist')
       if (isNode) {
+        const lib = (await import('pdfjs-dist/legacy/build/pdf.mjs')) as unknown as typeof PdfJs
         const { createRequire } = await import('node:module')
         const { pathToFileURL } = await import('node:url')
         const req = createRequire(import.meta.url)
         lib.GlobalWorkerOptions.workerSrc = pathToFileURL(
           req.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs'),
         ).href
-      } else {
-        const worker = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
-        lib.GlobalWorkerOptions.workerSrc = worker.default
+        return lib
+      }
+      const lib = await import('pdfjs-dist')
+      const workerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default
+      lib.GlobalWorkerOptions.workerSrc = workerUrl
+      if (typeof Worker !== 'undefined') {
+        lib.GlobalWorkerOptions.workerPort = new Worker(workerUrl, { type: 'module' })
       }
       return lib
     })()
   }
   return pdfjsPromise
+}
+
+function pdfBytes(data: ArrayBuffer): Uint8Array {
+  return new Uint8Array(data.slice(0))
+}
+
+async function loadPdf(data: ArrayBuffer) {
+  const pdfjsLib = await pdfjs()
+  return pdfjsLib.getDocument({ data: pdfBytes(data) }).promise
 }
 
 interface PdfBit {
@@ -78,8 +89,19 @@ export async function extractPdfFields(data: ArrayBuffer): Promise<{
   text: string
   pageCount: number
 }> {
-  const pdfjsLib = await pdfjs()
-  const pdf = await pdfjsLib.getDocument({ data }).promise
+  try {
+    return await extractPdfFieldsPdfJs(data)
+  } catch {
+    return extractPdfFieldsPdfLib(data)
+  }
+}
+
+async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
+  fields: DetectedField[]
+  text: string
+  pageCount: number
+}> {
+  const pdf = await loadPdf(data)
   const textParts: string[] = []
   const fields: DetectedField[] = []
 
@@ -149,9 +171,50 @@ export async function extractPdfFields(data: ArrayBuffer): Promise<{
   return { fields: dedupeFields(fields), text: textParts.join('\n\n'), pageCount: pdf.numPages }
 }
 
+async function extractPdfFieldsPdfLib(data: ArrayBuffer): Promise<{
+  fields: DetectedField[]
+  text: string
+  pageCount: number
+}> {
+  const { PDFCheckBox, PDFDocument, PDFDropdown, PDFRadioGroup, PDFTextField } = await import('pdf-lib')
+  const doc = await PDFDocument.load(pdfBytes(data), { ignoreEncryption: true })
+  let form
+  try {
+    form = doc.getForm()
+  } catch {
+    return { fields: [], text: '', pageCount: doc.getPageCount() }
+  }
+  const fields: DetectedField[] = []
+  for (const f of form.getFields()) {
+    const name = f.getName()
+    if (!name) continue
+    const checkbox = f instanceof PDFCheckBox || f instanceof PDFRadioGroup
+    const type = checkbox ? 'checkbox' : f instanceof PDFDropdown ? 'select' : f instanceof PDFTextField ? 'text' : 'text'
+    const fromName = name.replace(/[_[\]]+/g, ' ').trim()
+    const label = isGenericAcrobatName(fromName) ? fromName : fromName
+    fields.push({
+      id: `pdf_${name}_${fields.length}`,
+      name,
+      htmlId: name,
+      type,
+      tag: 'pdf',
+      label,
+      placeholder: '',
+      autocomplete: '',
+      nearbyText: name,
+      section: 'PDF',
+      options: [],
+      required: false,
+      tenantHint: 0,
+      roleHint: 'primary',
+      raw: { fieldName: name, acrobat: name },
+    })
+  }
+  return { fields: dedupeFields(fields), text: '', pageCount: doc.getPageCount() }
+}
+
 export async function renderPdfPages(data: ArrayBuffer, maxPages = 4): Promise<Blob[]> {
-  const pdfjsLib = await pdfjs()
-  const pdf = await pdfjsLib.getDocument({ data }).promise
+  const pdf = await loadPdf(data)
   const blobs: Blob[] = []
   const count = Math.min(pdf.numPages, maxPages)
   for (let i = 1; i <= count; i += 1) {

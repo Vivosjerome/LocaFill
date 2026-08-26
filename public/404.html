@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <title>LocaFill</title>
+    <script>
+      (function () {
+        var parts = location.pathname.split('/').filter(Boolean)
+        var repo = parts[0] || 'LocaFill'
+        var rest = parts.slice(1).join('/')
+        if (rest === 'index.html' || rest === '404.html') rest = ''
+        var hash = rest ? '#/' + rest : location.hash || ''
+        location.replace('/' + repo + '/' + hash + location.search)
+      })()
+    </script>
+  </head>
+  <body>
+    <p>Redirection vers LocaFill…</p>
+  </body>
+</html>

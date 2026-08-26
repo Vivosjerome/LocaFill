@@ -44,9 +44,10 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,svg,png,woff2,json}'],
-        maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+        globPatterns: ['**/*.{js,css,html,svg,png,woff2,json,mjs,wasm}'],
+        maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
         navigateFallback: 'index.html',
+        navigateFallbackDenylist: [/\.mjs$/i, /pdf\.worker/i],
         runtimeCaching: [
           {
             urlPattern: /^https:\/\/tessdata\.projectnaptha\.com\/.*/i,
