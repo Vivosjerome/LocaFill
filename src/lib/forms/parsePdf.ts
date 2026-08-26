@@ -561,7 +561,7 @@ function extractLayoutFields(input: {
     const x = zone.x1 + 2
     const w = zone.x2 - zone.x1 - 4
     const y = zone.y + Math.min(3, zone.h * 0.25)
-    if (taken(x, y) || w < 18) return
+    if (taken(x, y) || w < 28) return
     const slot = colSplit != null && labelX >= colSplit ? 1 : 0
     const tenant = hintsForPage(pageKind, slot)
     occupied.push({ x1: zone.x1, y1: zone.y - 4, x2: zone.x2, y2: zone.y + zone.h + 4 })
@@ -593,12 +593,17 @@ function extractLayoutFields(input: {
     const rowLeaders = allLines.filter((z) => onRow(z) && z.x1 >= labelEnd - 12).sort((a, b) => a.x1 - b.x1)
     if (rowLeaders[0]) {
       const z = rowLeaders[0]
-      return { ...z, x1: Math.max(z.x1, labelEnd + 2), x2: Math.min(z.x2, right) }
+      const x1 = Math.min(labelEnd + 4, right - 40)
+      if (right - x1 < 28) return null
+      return { x1, x2: right, y: z.y, h: Math.max(z.h, 9) }
     }
     const rowBox = boxes
       .filter((z) => sameCol(z) && Math.abs(z.y + z.h / 2 - labelY) <= 12 && z.x1 >= labelEnd - 8 && z.x1 < right)
       .sort((a, b) => a.x1 - b.x1)[0]
-    if (rowBox) return { x1: rowBox.x1 + 2, x2: Math.min(rowBox.x2 - 2, right), y: rowBox.y + 2, h: rowBox.h }
+    if (rowBox) {
+      const x1 = Math.min(Math.max(rowBox.x1 + 2, labelEnd + 4), right - 40)
+      return { x1, x2: right, y: rowBox.y + 2, h: rowBox.h }
+    }
     const below = [...allLines, ...boxes]
       .filter((z) => sameCol(z) && z.y < labelY - 1 && labelY - z.y < 22 && z.x2 > labelEnd - 20 && z.x1 < right)
       .sort((a, b) => labelY - (a.y + (a.h || 0)) - (labelY - (b.y + (b.h || 0))) || a.x1 - b.x1)
@@ -606,7 +611,7 @@ function extractLayoutFields(input: {
       const z = below[0]
       return {
         x1: Math.min(Math.max(z.x1, left), z.x2 - 24),
-        x2: Math.min(z.x2, right),
+        x2: right,
         y: z.y + 2,
         h: Math.max(z.h, 9),
       }
@@ -635,11 +640,29 @@ function extractLayoutFields(input: {
       let zone = zoneFor(end, line.y, group[0].x)
       if (!zone) {
         const nextX = groups[gi + 1]?.[0]?.x ?? colEnd(group[0].x)
-        if (nextX - end >= 52) {
-          zone = { x1: end + 16, x2: nextX - 8, y: line.y, h: Math.max(line.h, 10) }
+        if (nextX - end >= 40) {
+          zone = { x1: end + 8, x2: colEnd(group[0].x), y: line.y, h: Math.max(line.h, 10) }
         }
       }
-      if (zone) push(label, zone, line.text, group[0].x)
+      if (zone) {
+        push(label, zone, line.text, group[0].x)
+        const labelX = group[0].x
+        if (colSplit != null && labelX < colSplit) {
+          const hasRightLabel = groups.some((g) => g[0].x >= colSplit)
+          if (!hasRightLabel) {
+            const rightLead = allLines
+              .filter((z) => z.x1 >= colSplit - 8 && Math.abs(z.y - line.y) <= 9)
+              .sort((a, b) => a.x1 - b.x1)[0]
+            const rightZone: FillZone = {
+              x1: rightLead ? Math.max(colSplit + 6, rightLead.x1) : colSplit + 10,
+              x2: pageW - 16,
+              y: zone.y,
+              h: zone.h,
+            }
+            if (rightZone.x2 - rightZone.x1 >= 28) push(label, rightZone, line.text, colSplit + 8)
+          }
+        }
+      }
     }
   }
 
@@ -758,7 +781,9 @@ function findColumnSplit(lines: PdfLine[], pageW: number, pageText: string): num
       if (x1 == null && /(?:locataire|cautionnaire|caution|garant|candidat)\s*1/.test(local)) x1 = bits[i].x
       if (/(?:locataire|cautionnaire|caution|garant|candidat)\s*2/.test(local)) x2 = bits[i].x
     }
-    if (x1 != null && x2 != null && x2 > x1 + 40) return Math.round((x1 + x2) / 2)
+    if (x1 != null && x2 != null && x2 > x1 + Math.max(90, pageW * 0.28)) {
+      return Math.round((x1 + x2) / 2)
+    }
   }
 
   let votes = 0
@@ -867,10 +892,18 @@ function cleanLabel(text: string): string {
 
 function dedupeFields(fields: DetectedField[]): DetectedField[] {
   const seen = new Set<string>()
-  return fields.filter((f) => {
+  const firstPass = fields.filter((f) => {
     const key = `${f.name}|${f.raw.page ?? ''}|${f.raw.x ?? ''}|${f.tenantHint}`
     if (seen.has(key)) return false
     seen.add(key)
     return true
   })
+  const best = new Map<string, DetectedField>()
+  for (const f of firstPass) {
+    const key = `${f.raw.page}|${f.label}|${f.tenantHint}|${f.roleHint}|${Math.round(Number(f.raw.y) / 4)}`
+    const prev = best.get(key)
+    if (!prev || Number(f.raw.w) > Number(prev.raw.w)) best.set(key, f)
+  }
+  const keep = new Set(best.values())
+  return firstPass.filter((f) => keep.has(f))
 }

@@ -101,7 +101,6 @@ function drawOverlay(
 
   const maxW = Math.max(24, Number(field.raw.w) || 140)
   const boxH = Math.max(8, Number(field.raw.h) || 11)
-  const size = Math.min(10, Math.max(7, boxH * 0.78))
   const color = rgb(0.07, 0.12, 0.1)
   const text = toWinAnsi(value)
   if (!text) return false
@@ -113,25 +112,86 @@ function drawOverlay(
       }
       return true
     }
-    const fitted = fitText(text, font, size, maxW - 4)
-    if (!fitted) return false
-    page.drawText(fitted, { x: x + 2, y: Math.max(4, y), size, font, color })
+    const fitted = layoutOverlayText(text, font, maxW - 4, boxH)
+    if (!fitted.lines.length) return false
+    const lineH = fitted.size + 1.4
+    fitted.lines.forEach((line, i) => {
+      page.drawText(line, {
+        x: x + 2,
+        y: Math.max(4, y - i * lineH),
+        size: fitted.size,
+        font,
+        color,
+      })
+    })
     return true
   } catch {
     return false
   }
 }
 
-function fitText(
+function layoutOverlayText(
+  text: string,
+  font: { widthOfTextAtSize: (t: string, s: number) => number },
+  maxW: number,
+  boxH: number,
+): { lines: string[]; size: number } {
+  let size = Math.min(10, Math.max(7, boxH * 0.78))
+  const minSize = 6
+  while (size > minSize && font.widthOfTextAtSize(text, size) > maxW) size -= 0.5
+  if (font.widthOfTextAtSize(text, size) <= maxW) return { lines: [text], size }
+
+  const wrapped = wrapOverlayLine(text, font, size, maxW)
+  if (wrapped.length <= 2) return { lines: wrapped, size }
+
+  size = minSize
+  const tight = wrapOverlayLine(text, font, size, maxW)
+  return { lines: tight.slice(0, 3), size }
+}
+
+function wrapOverlayLine(
   text: string,
   font: { widthOfTextAtSize: (t: string, s: number) => number },
   size: number,
   maxW: number,
-): string {
-  if (font.widthOfTextAtSize(text, size) <= maxW) return text
-  let cut = text
-  while (cut.length > 1 && font.widthOfTextAtSize(`${cut}...`, size) > maxW) cut = cut.slice(0, -1)
-  return `${cut}...`
+): string[] {
+  if (font.widthOfTextAtSize(text, size) <= maxW) return [text]
+  const at = text.indexOf('@')
+  if (at > 0) {
+    const left = text.slice(0, at)
+    const right = text.slice(at)
+    if (font.widthOfTextAtSize(left, size) <= maxW && font.widthOfTextAtSize(right, size) <= maxW) {
+      return [left, right]
+    }
+  }
+  const words = text.split(/(\s+)/).filter((p) => p.length)
+  const lines: string[] = []
+  let cur = ''
+  const flush = () => {
+    if (cur) lines.push(cur)
+    cur = ''
+  }
+  for (const part of words) {
+    const next = cur + part
+    if (cur && font.widthOfTextAtSize(next, size) > maxW) {
+      flush()
+      cur = part.trimStart()
+    } else {
+      cur = next
+    }
+  }
+  flush()
+  if (lines.length >= 2) return lines
+  const chars: string[] = []
+  let chunk = ''
+  for (const ch of text) {
+    if (chunk && font.widthOfTextAtSize(chunk + ch, size) > maxW) {
+      chars.push(chunk)
+      chunk = ch
+    } else chunk += ch
+  }
+  if (chunk) chars.push(chunk)
+  return chars.length ? chars : [text]
 }
 
 function toWinAnsi(text: string): string {

@@ -101,6 +101,9 @@ if (!byLabel(/code postal et ville/i).some((m) => /64600/i.test(m.displayValue))
 if (!mapped.some((m) => fieldOf(m)?.label === 'Nom & Prénom' && fieldOf(m)?.roleHint === 'primary' && m.displayValue === 'Jerome VIVOS')) {
   fail.push('Nom locataire 1 doit être Jerome VIVOS')
 }
+if (!mapped.some((m) => fieldOf(m)?.label === 'Adresse mail' && fieldOf(m)?.roleHint === 'primary' && m.displayValue === 'vivosjerome64@gmail.com')) {
+  fail.push('E-mail locataire 1 doit être complet, pas tronqué')
+}
 if (mapped.some((m) => fieldOf(m)?.label === 'Nom du locataire' && m.displayValue === 'X')) {
   fail.push('Nom du locataire ne doit pas prendre le nom du co-locataire')
 }

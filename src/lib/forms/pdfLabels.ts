@@ -42,7 +42,14 @@ export function isNoisePdfLabel(text: string): boolean {
   if (!n || n.length < 2) return true
   if (isSectionHeading(t)) return true
   if (isDocumentChecklist(t)) return true
-  if (/^(fait a|fait le a|le|a|eme|votre agence|loyer c c|reference adresse du bien)$/.test(n)) return true
+  if (
+    /^(fait a|fait le a|le|a|eme|votre agence|loyer|loyer c c|honoraires|p charges|d g|depot de garantie|date d effet du bail|ou avez vous vu l annonce|reference adresse du bien)$/.test(
+      n,
+    )
+  ) {
+    return true
+  }
+  if (/adresse du logement|reference du bien/.test(n)) return true
   if (/^mademoiselle madame monsieur$/.test(n)) return true
   if (/^madame,? monsieur$/.test(n)) return true
   if (/^nee le ne le$/.test(n)) return true
@@ -72,7 +79,7 @@ export function classifyPdfPage(pageText: string): PdfPageKind {
   if (/attestation d hebergement|attestation de rattachement|foyer fiscal/.test(n)) return 'skip'
   if (/attestation employeur/.test(n)) return 'employer-letter'
   if (/pieces a fournir/.test(n) && /garant|caution/.test(n)) return 'guarantor-docs'
-  if (/pieces a fournir/.test(n)) return 'tenant-docs'
+  if (/pieces a fournir|documents a fournir/.test(n)) return 'tenant-docs'
   const hasCautionCols = /cautionnaire\s*[12]|caution\s*[12]|garant\s*[12]/.test(n)
   const hasTenantCols = /locataire\s*[12]/.test(n)
   if (/candidature\s+garants?\b/.test(n) && !/candidature\s+locataires/.test(n)) return 'guarantor-form'
