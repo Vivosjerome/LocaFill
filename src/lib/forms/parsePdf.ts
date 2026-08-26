@@ -169,6 +169,7 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
         const ocrLines = await linesFromOcrPage(page)
         if (ocrLines.length) layoutLines = ocrLines
       }
+      const guides = await extractFillGuides(page)
       fields.push(
         ...extractLayoutFields({
           lines: layoutLines,
@@ -177,6 +178,7 @@ async function extractPdfFieldsPdfJs(data: ArrayBuffer): Promise<{
           pageKind,
           twoCols,
           occupied: pending.map((p) => p.widget.rect),
+          guides,
         }),
       )
     }
@@ -372,6 +374,155 @@ function overlayRaw(
   }
 }
 
+interface FillZone {
+  x1: number
+  x2: number
+  y: number
+  h: number
+}
+
+async function extractFillGuides(page: PdfJs.PDFPageProxy): Promise<{ lines: FillZone[]; boxes: FillZone[] }> {
+  const lib = await pdfjs()
+  const OPS = lib.OPS
+  const opList = await page.getOperatorList()
+  const pageW = page.view[2] - page.view[0]
+  const pageH = page.view[3] - page.view[1]
+  const onPage = (b: { x1: number; x2: number; y1: number; y2: number }) =>
+    b.x1 > -40 && b.x2 < pageW + 40 && b.y1 > -40 && b.y2 < pageH + 40
+  const raw: FillZone[] = []
+  const boxes: FillZone[] = []
+  const stack: number[][] = []
+  let ctm = [1, 0, 0, 1, 0, 0]
+
+  const mul = (a: number[], b: number[]) => [
+    a[0] * b[0] + a[2] * b[1],
+    a[1] * b[0] + a[3] * b[1],
+    a[0] * b[2] + a[2] * b[3],
+    a[1] * b[2] + a[3] * b[3],
+    a[0] * b[4] + a[2] * b[5] + a[4],
+    a[1] * b[4] + a[3] * b[5] + a[5],
+  ]
+  const mapBox = (x0: number, y0: number, x1: number, y1: number) => {
+    const pts = [
+      [x0, y0],
+      [x1, y0],
+      [x0, y1],
+      [x1, y1],
+    ].map(([x, y]) => ({
+      x: ctm[0] * x + ctm[2] * y + ctm[4],
+      y: ctm[1] * x + ctm[3] * y + ctm[5],
+    }))
+    const xs = pts.map((p) => p.x)
+    const ys = pts.map((p) => p.y)
+    return {
+      x1: Math.min(...xs),
+      x2: Math.max(...xs),
+      y1: Math.min(...ys),
+      y2: Math.max(...ys),
+    }
+  }
+
+  for (let i = 0; i < opList.fnArray.length; i += 1) {
+    const fn = opList.fnArray[i]
+    const args = opList.argsArray[i] as unknown
+    if (fn === OPS.save) stack.push(ctm.slice())
+    else if (fn === OPS.restore) ctm = stack.pop() || ctm
+    else if (fn === OPS.transform && Array.isArray(args) && args.length >= 6) {
+      ctm = mul(ctm, args as number[])
+    } else if (fn === OPS.constructPath) {
+      const mm = readMinMax(args)
+      if (!mm) continue
+      const mapped = mapBox(mm[0], mm[1], mm[2], mm[3])
+      const plain = {
+        x1: Math.min(mm[0], mm[2]),
+        x2: Math.max(mm[0], mm[2]),
+        y1: Math.min(mm[1], mm[3]),
+        y2: Math.max(mm[1], mm[3]),
+      }
+      const box = onPage(mapped) ? mapped : plain
+      const w = box.x2 - box.x1
+      const h = box.y2 - box.y1
+      if (w < 18) continue
+      if (h <= 3.8) {
+        raw.push({ x1: box.x1, x2: box.x2, y: (box.y1 + box.y2) / 2, h: Math.max(h, 1) })
+      } else if (h >= 7 && h <= 42 && w >= 28) {
+        boxes.push({ x1: box.x1, x2: box.x2, y: box.y1, h })
+      }
+    }
+  }
+
+  return { lines: mergeZones(raw, 8), boxes: mergeZones(boxes, 4) }
+}
+
+function readMinMax(args: unknown): number[] | null {
+  const list = Array.isArray(args) ? args : args != null ? [args] : []
+  for (const item of list) {
+    if (!item) continue
+    if (Array.isArray(item) && item.length >= 4 && item.slice(0, 4).every((v) => typeof v === 'number')) {
+      const [a, b, c, d] = item as number[]
+      return [Math.min(a, c), Math.min(b, d), Math.max(a, c), Math.max(b, d)]
+    }
+    if (typeof item === 'object' && item !== null && 'length' in item) {
+      const arr = Array.from(item as ArrayLike<number>)
+      if (arr.length >= 4 && arr.slice(0, 4).every((v) => typeof v === 'number' && Number.isFinite(v))) {
+        return [Math.min(arr[0], arr[2]), Math.min(arr[1], arr[3]), Math.max(arr[0], arr[2]), Math.max(arr[1], arr[3])]
+      }
+    }
+  }
+  return null
+}
+
+function mergeZones(zones: FillZone[], gap: number): FillZone[] {
+  const sorted = [...zones].sort((a, b) => a.y - b.y || a.x1 - b.x1)
+  const out: FillZone[] = []
+  for (const z of sorted) {
+    const hit = out.find((o) => Math.abs(o.y - z.y) < 2.2 && z.x1 <= o.x2 + gap && z.x2 >= o.x1 - gap)
+    if (hit) {
+      hit.x1 = Math.min(hit.x1, z.x1)
+      hit.x2 = Math.max(hit.x2, z.x2)
+      hit.h = Math.max(hit.h, z.h)
+    } else out.push({ ...z })
+  }
+  return out.filter((z) => z.x2 - z.x1 >= 22)
+}
+
+function isLeaderText(text: string): boolean {
+  const t = text.replace(/\s/g, '')
+  if (!t) return false
+  if (/^[.\-_·•…=\u2013\u2014]{1,}$/.test(t)) return true
+  const rest = t.replace(/[.\-_·•…=\u2013\u2014]/g, '')
+  return t.length >= 3 && rest.length / t.length <= 0.2
+}
+
+function leaderZonesFromLine(line: PdfLine): FillZone[] {
+  const zones: FillZone[] = []
+  let run: PdfBit[] = []
+  const flush = () => {
+    if (!run.length) return
+    const x1 = run[0].x
+    const last = run[run.length - 1]
+    const x2 = last.x + last.w
+    if (x2 - x1 >= 16) zones.push({ x1, x2, y: line.y, h: Math.max(line.h, 8) })
+    run = []
+  }
+  for (const bit of line.bits) {
+    const mixed = bit.str.match(/^(.*?)([.\-_·•…]{3,})(.*)$/)
+    if (mixed && mixed[1].replace(/\s/g, '').length > 0) {
+      flush()
+      const startRatio = mixed[1].length / Math.max(1, bit.str.length)
+      const leaderLen = mixed[2].length / Math.max(1, bit.str.length)
+      const x1 = bit.x + bit.w * startRatio
+      const x2 = x1 + bit.w * leaderLen
+      if (x2 - x1 >= 16) zones.push({ x1, x2, y: line.y, h: Math.max(line.h, 8) })
+      continue
+    }
+    if (isLeaderText(bit.str)) run.push(bit)
+    else flush()
+  }
+  flush()
+  return zones
+}
+
 function extractLayoutFields(input: {
   lines: PdfLine[]
   pageIndex: number
@@ -379,24 +530,34 @@ function extractLayoutFields(input: {
   pageKind: PdfPageKind
   twoCols: boolean
   occupied: PdfWidget['rect'][]
+  guides: { lines: FillZone[]; boxes: FillZone[] }
 }): DetectedField[] {
-  const { lines, pageIndex, pageW, pageKind, twoCols, occupied } = input
+  const { lines, pageIndex, pageW, pageKind, twoCols, occupied, guides } = input
   const fields: DetectedField[] = []
+  const textLeaders = lines.flatMap(leaderZonesFromLine)
+  const allLines = mergeZones([...guides.lines, ...textLeaders], 10)
+  const boxes = guides.boxes
 
   const taken = (x: number, y: number) =>
-    occupied.some((r) => x >= r.x1 - 10 && x <= r.x2 + 10 && y >= r.y1 - 10 && y <= r.y2 + 10)
+    occupied.some((r) => x >= r.x1 - 8 && x <= r.x2 + 8 && y >= r.y1 - 8 && y <= r.y2 + 8)
 
-  const colEnd = (x: number) => (twoCols && x < pageW * 0.48 ? pageW * 0.48 - 12 : pageW - 18)
+  const colEnd = (x: number) => (twoCols && x < pageW * 0.48 ? pageW * 0.48 - 10 : pageW - 16)
 
-  const push = (label: string, x: number, y: number, w: number, h: number, nearby: string) => {
-    const cleaned = cleanLabel(label)
+  const labelBits = (line: PdfLine) =>
+    line.bits.filter((b) => !isLeaderText(b.str) && b.str.replace(/[.\-_·•…]/g, '').trim().length > 0)
+
+  const push = (label: string, zone: FillZone, nearby: string) => {
+    const cleaned = cleanLabel(label.replace(/[.\-_·•…]{2,}/g, ' '))
     if (!cleaned || isNoisePdfLabel(cleaned) || isSectionHeading(cleaned) || isDocumentChecklist(cleaned)) return
     if (!looksLikeFieldLabel(cleaned)) return
     if (isMaritalDetailLabel(cleaned) || isEmployerSignatoryLabel(cleaned)) return
-    if (taken(x, y) || w < 22) return
+    const x = zone.x1 + 2
+    const w = zone.x2 - zone.x1 - 4
+    const y = zone.y + Math.min(3, zone.h * 0.25)
+    if (taken(x, y) || w < 18) return
     const slot = twoCols && x > pageW * 0.48 ? 1 : 0
     const tenant = hintsForPage(pageKind, slot)
-    occupied.push({ x1: x, y1: y - 4, x2: x + w, y2: y + h + 4 })
+    occupied.push({ x1: zone.x1, y1: zone.y - 4, x2: zone.x2, y2: zone.y + zone.h + 4 })
     fields.push({
       id: `pdf_overlay_${pageIndex}_${Math.round(x)}_${Math.round(y)}_${fields.length}`,
       name: `overlay:${pageIndex}:${Math.round(x)}:${Math.round(y)}`,
@@ -407,44 +568,63 @@ function extractLayoutFields(input: {
       placeholder: '',
       autocomplete: '',
       nearbyText: nearby,
-      section: nearestSection({ x1: x, y1: y, x2: x + w, y2: y + h }, lines) || `Page ${pageIndex}`,
+      section: nearestSection({ x1: x, y1: y, x2: x + w, y2: y + 10 }, lines) || `Page ${pageIndex}`,
       options: [],
       required: false,
       tenantHint: tenant.tenantHint,
       roleHint: tenant.roleHint,
-      raw: overlayRaw(pageIndex, x, y, w, h),
+      raw: overlayRaw(pageIndex, x, y, w, Math.max(9, zone.h)),
     })
   }
 
-  for (const line of lines) {
-    const bits = line.bits
-    if (!bits.length) continue
+  const zoneFor = (labelEnd: number, labelY: number, left: number): FillZone | null => {
+    const right = colEnd(left)
+    const onRow = (z: FillZone) => Math.abs(z.y - labelY) <= 9 && z.x2 > labelEnd + 6 && z.x1 < right + 8
+    const rowLeaders = allLines.filter((z) => onRow(z) && z.x1 >= labelEnd - 12).sort((a, b) => a.x1 - b.x1)
+    if (rowLeaders[0]) {
+      const z = rowLeaders[0]
+      return { ...z, x1: Math.max(z.x1, labelEnd + 2) }
+    }
+    const rowBox = boxes
+      .filter((z) => Math.abs(z.y + z.h / 2 - labelY) <= 12 && z.x1 >= labelEnd - 8 && z.x1 < right)
+      .sort((a, b) => a.x1 - b.x1)[0]
+    if (rowBox) return { x1: rowBox.x1 + 2, x2: rowBox.x2 - 2, y: rowBox.y + 2, h: rowBox.h }
+    const below = [...allLines, ...boxes]
+      .filter((z) => z.y < labelY - 1 && labelY - z.y < 22 && z.x2 > labelEnd - 20 && z.x1 < right)
+      .sort((a, b) => labelY - (a.y + (a.h || 0)) - (labelY - (b.y + (b.h || 0))) || a.x1 - b.x1)
+    if (below[0]) {
+      const z = below[0]
+      return { x1: Math.min(Math.max(z.x1, left), z.x2 - 24), x2: Math.min(z.x2, right), y: z.y + 2, h: Math.max(z.h, 9) }
+    }
+    return null
+  }
 
-    for (let i = 0; i < bits.length; i += 1) {
-      const next = bits[i + 1]
-      const gap = next ? next.x - (bits[i].x + bits[i].w) : colEnd(bits[i].x) - (bits[i].x + bits[i].w)
-      if (gap < 26) continue
-      const left = bits
-        .slice(0, i + 1)
+  for (const line of lines) {
+    const useful = labelBits(line)
+    if (!useful.length) continue
+    const groups: PdfBit[][] = [[useful[0]]]
+    for (const bit of useful.slice(1)) {
+      const cur = groups[groups.length - 1]
+      const prev = cur[cur.length - 1]
+      if (bit.x - (prev.x + prev.w) < 14) cur.push(bit)
+      else groups.push([bit])
+    }
+    for (let gi = 0; gi < groups.length; gi += 1) {
+      const group = groups[gi]
+      const label = group
         .map((b) => b.str)
         .join(' ')
         .replace(/\s+/g, ' ')
         .trim()
-      if (!looksLikeFieldLabel(left)) continue
-      push(left, bits[i].x + bits[i].w + 4, line.y, gap - 8, line.h, line.text)
-    }
-
-    const trimmed = line.text.replace(/[_\.…]{3,}/g, '').trim()
-    if (
-      looksLikeFieldLabel(trimmed) &&
-      line.x2 < colEnd(line.x1) - 40 &&
-      bits.length <= 8
-    ) {
-      const x = line.x2 + 8
-      const w = colEnd(line.x1) - x
-      if (w >= 28 && !line.text.match(/[_\.…]{6,}/)) {
-        push(trimmed, x, line.y, w, line.h, line.text)
+      const end = group[group.length - 1].x + group[group.length - 1].w
+      let zone = zoneFor(end, line.y, group[0].x)
+      if (!zone) {
+        const nextX = groups[gi + 1]?.[0]?.x ?? colEnd(group[0].x)
+        if (nextX - end >= 52) {
+          zone = { x1: end + 16, x2: nextX - 8, y: line.y, h: Math.max(line.h, 10) }
+        }
       }
+      if (zone) push(label, zone, line.text)
     }
   }
 
